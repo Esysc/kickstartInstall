@@ -168,7 +168,7 @@ EOF
 %end
 %post --nochroot
 kill -9 \$PID
-aleep 15
+sleep 15
 $CURL  -d "{\"status\":\"<b>The iso image $ISO has been installed.<br />Client is rebooting with custom initial configuration</b>\",\"progress\":\"100\"}" $URL
 %end
 EOF_POST
