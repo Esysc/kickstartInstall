@@ -1,0 +1,736 @@
+#!/bin/bash  
+# ---------------------------------------------------------------------------
+# genericLinuxKickstart - Restore comopletely Generic iso image (RedHat)  to new physical/virtual machines using the existing PXE environment
+
+# Copyright 2015, root <root@drbl01>
+  
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License at <http://www.gnu.org/licenses/> for
+# more details.
+
+# Usage: genericLinuxKickstart [-h|--help] [-iso] [-ip] [-n] [-g] [-s] [-h] [-pos] [-iloip] [-ilonm]
+
+# Revision history:
+# 2015-04-23 Created by template_generator ver. 3.3
+# Added time server synchronisation part 2015-05-12
+# 2015-06-1  - Added support to GEN 9 servers (removed hpacu* and installed hpssa* )
+# 2015-06-1  - Added  GrubInstall function to refresh grub installation
+# 2015-06-17 - Removed   hyphens from function nameing convention, replace within underscore
+# 2015-06-18 - Added check permission function to set the setuid on user
+# 2015-08-17 - Migration from genericLinuxKickstart to kickstart installation type to use new generic images 
+# 2016-02-16 - changed repo line to point to http url instead of search for custom packages in localdisk (added for redhat 7)
+# 2019-02-17 - Added netwroking script for post install tasks
+# TODO : add part /boot/efi --fstype=efi --grow --maxsize=200 --size=20 if efi in kickstart standard file (when uefi will be supported if not already present in kickstart file)
+# ---------------------------------------------------------------------------
+PROGNAME=${0##*/}
+VERSION="1.2"
+KSDIR="/var/www/Confnet"
+KSDEFAULTNAME="nagra-ks.cfg"
+PXEBOOTDIR="/var/www/BOOT"
+WEBSERVER="http://10.0.205.203"
+DRBL="10.0.205.203"
+# Find the mac address of this machine, pxe boot file and ks.cfg will be named in this way
+
+MAC=$(ifconfig -a | 
+awk '/^[a-z]/ { iface=$1; mac=$NF ; next } 
+ /inet addr:/ { print mac }' | head -1)
+lowerMAC=${MAC,,}
+
+
+
+
+syncTime () {
+step="Synching server time: "
+log INFO "$step current date is $(date)"
+log INFO "$step stopping the ntp service..."
+service ntp stop
+log INFO "$step contacting the 10.0.205.204 server ..."
+ntpdate 10.0.205.204
+log INFO "$step setting the hardware clock to UTC"
+hwclock --systohc --utc
+
+
+}
+
+
+
+createConf () {
+
+# THe name of the new kickstart file
+KSTOCHANGE="$WEBSERVER/$ISO/$KSDEFAULTNAME"
+URLKS="$WEBSERVER/Confnet/ks-$lowerMAC "
+URLISODIR="url --url $WEBSERVER/$ISO"
+
+log INFO "Downloading $KSTOCHANGE"
+# download the file
+wget -O /tmp/ks-$lowerMAC $KSTOCHANGE
+
+
+if [ $? -ne 0 ]; then
+	log ERROR"!! Error $WEBSERVER/$ISO/$KSDEFAULTNAME not found, I can't continue !!"
+        error_exit "!! Error $WEBSERVER/$ISO/$KSDEFAULTNAME not found, I can't continue !!"
+	exit 1
+fi
+
+
+# Insert the url param at position 30 
+#log INFO "Inserting at position 30 url image $URLISODIR"
+#sed -i -e "30i$URLISODIR" /tmp/ks-$lowerMAC
+
+#change the repo line to point to http for PXE purposes
+log WARN "Changing repo from \"--baseurl=file:///run/install/repo/CustomPackages\" to \"--baseurl=http://10.0.205.203/$ISO/CustomPackages\" if found"
+
+sed -i "s|file:///run/install/repo/CustomPackages|http://10.0.205.203/$ISO/CustomPackages|g"  /tmp/ks-$lowerMAC
+
+log WARN "Changing any localhost name to $hostname ..."
+
+sed -i "s|localhost|$hostname|g" /tmp/ks-$lowerMAC
+# Adding customisation section pre and post
+KSPRE="/tmp/pre"
+PK="[$salesOrder][$subid]"
+URL="http://spmgt.hq.k.grp/SPOT/provisioning/api/provisioningnotifications/$PK"
+CURL="curl  --globoff -i -v -A \"perl\" -X PUT"
+
+cat > $KSPRE << EOF_PRE
+%pre
+$CURL  -d "{\"status\":\"<b>Anaconda is starting to deploy $ISO image... <br />The process may take 10 minutes...  </b>\",\"progress\":\"80\", \"configuredip\":\"$ipaddress\"}" $URL
+
+cat > /tmp/rpm_watcher.sh << "EOF_RPM"
+ANACONDADIR="/tmp"
+ANALOG="/tmp/anaconda.log"
+INSLOG="/mnt/sysimage/root/install.log"
+STATUS=""
+ANALINE=""
+while true
+do  
+    
+    ANALINE=""
+    COUNT="\$(rpm -qa | wc -l)"
+    if [ \${COUNT} -ne 0 ]; then
+                STATUS="Installation Package RPM count \${COUNT}<br />"
+
+    else
+         STATUS="Anaconda is formatting the partition and prepare environment to start packages installation<br />"
+    fi
+
+		 ANALINE="\$(tail -1 \$ANALOG) <br /> \$(tail -1 \$INSLOG) "
+
+    for LogFile in \$ANACONDADIR/*log
+    do
+		[[  ! \$LogFile == *ifcfg* ]] &&  [[ ! \$LogFile == *ks-script* ]] && [[ ! \$LogFile == *program* ]] && ANALINE="\$ANALINE <br />  \$(basename \$LogFile):  <span style='tab-size: 10;'>\$(tail -1 \$LogFile)</span>"
+    done
+				ANALINE="\$ANALINE <br /> \$(tail -1 \$INSLOG) "
+    STATUS="\$STATUS \$ANALINE"
+#    STATUS=\$(echo \$STATUS | tr \\" \\')
+    
+    $CURL  -d "{\"status\":\"<p class='badge badge-info'>\$STATUS</p>\", \"configuredip\":\"$ipaddress\"}" $URL
+    sleep 10
+done
+EOF_RPM
+chmod +x  /tmp/rpm_watcher.sh 
+/tmp/rpm_watcher.sh > /dev/null 2>&1 < /dev/null &
+PID=\$\$
+%end
+EOF_PRE
+
+
+
+#BROADCAST=$(ipcalc "$ipaddress/$netmask" | grep Broadcast | awk '{print $2}')
+#NETWORK=$(ipcalc "$ipaddress/$netmask" | grep Network | awk '{print $2}' | awk -F "/" '{print $1}')
+data=$(date)
+
+
+KSPOST="/tmp/post"
+
+cat > $KSPOST << EOF_POST
+%post --nochroot
+kill -9 \$PID
+sleep 15
+$CURL  -d "{\"status\":\"<b>The iso image $ISO has been installed.<br />Client is rebooting with custom initial configuration</b>\",\"progress\":\"100\", \"configuredip\":\"$ipaddress\"}" $URL
+%end
+
+
+%post
+
+wget -O /tmp/network-config-cli.sh http://10.0.205.203/Confnet/network-config-cli.sh
+chmod +x /tmp/network-config-cli.sh
+/tmp/network-config-cli.sh -n $hostname
+/tmp/network-config-cli.sh -c "\$(/tmp/network-config-cli.sh -a | awk '{print \$1}')" -i $ipaddress -m $netmask -g $gateway -R
+rm -f /tmp/network-config-cli.sh
+
+
+
+echo $gateway'      time' >> /etc/hosts
+echo 'time' >> /etc/ntp/step-tickers
+#/bin/sed -i '/pool.ntp.org/d' /etc/ntp.conf
+echo 'server time' >> /etc/ntp.conf
+
+echo Installation number:  $salesOrder performed on $data >> /home/root/.syp_log
+
+%end
+EOF_POST
+
+# Write the complete ks file
+
+cat $KSPRE >> /tmp/ks-$lowerMAC
+cat $KSPOST >> /tmp/ks-$lowerMAC
+
+#Transfere the file in right position
+log INFO "Transferring the kickstart file on server: "
+
+
+kscontent=$(cat /tmp/ks-$lowerMAC)
+ksfile="$KSDIR/ks-$lowerMAC"
+
+#echo "$kscontent" | sshpass -p Superuser ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t root@$DRBL "cat > $ksfile" 
+sshpass -p Superuser ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t root@$DRBL "cat > $ksfile" <  /tmp/ks-$lowerMAC
+
+if [ $? -ne 0 ]; then
+        log ERROR"!! Error : unable to transfer kickstart file /tmp/ks-$lowerMAC to server in ksfile. Aborted!"
+        error_exit "!! Error : unable to transfer kickstart file /tmp/ks-$lowerMAC to server in ksfile. Aborted!"
+        exit 1
+fi
+
+
+
+#Prepare the boot files
+
+log INFO "Preparing boot files for pxe/ipxe/grub"
+
+
+MACSyslinux=01-${lowerMAC//:/-}
+MACGrub=01-${lowerMAC}
+bootSyslinux="/tftpboot/nbi_img/pxelinux.cfg/$MACSyslinux"
+bootGrub="/tftpboot/nbi_img/pxelinux.cfg/$MACGrub"
+bootIpxe="$PXEBOOTDIR/$lowerMAC"
+#Check version of redhat
+
+syslinuxCFG="
+default vesamenu.c32
+timeout 70
+prompt 0
+noescape 1
+MENU MARGIN 5
+MENU BACKGROUND nagra.jpg
+# Set the color for unselected menu item and timout message
+MENU COLOR UNSEL 7;32;41 #c0000090 #00000000
+MENU COLOR TIMEOUT_MSG 7;32;41 #c0000090 #00000000
+MENU COLOR TIMEOUT 7;32;41 #c0000090 #00000000
+MENU COLOR HELP 7;32;41 #c0000090 #00000000
+say **********************************************
+say Welcome to REDHAT Install.
+say **********************************************
+# Allow client to edit boot parameters
+ALLOWOPTIONS 1
+# simple menu title
+MENU TITLE NAGRAVISION (http://www.nagra.com)
+label  $ISO
+MENU DEFAULT
+MENU LABEL  $ISO
+kernel /$ISO/images/pxeboot/vmlinuz
+initrd /$ISO/images/pxeboot/initrd.img
+append ks=$URLKS network ksdevice=$lowerMAC  repo=http://10.0.205.203:/$ISO
+"
+grubCFG="
+if [ \"\${grub_platform}\" = \"efi\" ]; then
+menuentry $ISO --class fedora {
+echo 'Loading Kernel .....'
+linuxefi /$ISO/images/pxeboot/vmlinuz ks=$URLKS  ksdevice=$lowerMAC  repo=http://10.0.205.203/$ISO
+echo 'Loading Initrd... '
+initrdefi /$ISO/images/pxeboot/initrd.img
+}
+
+else
+menuentry '$ISO' --class fedora {
+echo 'Loading Kernel .....'
+linux /$ISO/images/pxeboot/vmlinuz ks=$URLKS  ksdevice=$lowerMAC  repo=http//10.0.205.203/$ISO
+echo 'Loading Initrd... '
+initrd /$ISO/images/pxeboot/initrd.img
+
+}
+fi
+"
+
+
+ipxeCFG='
+<?php
+echo "  item --key r '$ISO'   (r)'$ISO' \n";
+echo "  item\n";
+echo "  choose --default '$ISO' --timeout 30000 target && goto \${target} || goto cancelled\n";
+echo "  :'$ISO'  \n";
+echo "  initrd \${remote-root}/'$ISO'/images/pxeboot/initrd.img\n";
+echo "  chain  \${remote-root}/'$ISO'/images/pxeboot/vmlinuz repo=http://10.0.205.203/'$ISO' ks='$URLKS'  ksdevice='$lowerMAC' \n";
+echo "  boot || goto failed\n";
+echo " :failed\n";
+$jsonDash = array("status" => "BOOT FAILED!!! May be some files has not been found. Check within a KVM", "progress" => "0");
+updateDashboard($jsonDash);
+?>
+'
+
+
+log INFO "Copying my bootfiles on Server....."
+#Create the boot files
+echo "$syslinuxCFG" | sshExe $DRBL "cat >  $bootSyslinux"
+echo "$grubCFG" | sshExe $DRBL "cat >  $bootGrub"
+echo "$ipxeCFG" | sshExe $DRBL "cat >  $bootIpxe"
+
+
+
+}
+
+
+setILOMIRROR () {
+# Settings for ILO and mirror of disks
+#mirroring is done if number of disk=2 and logical disk = 0
+ILO_hostname="ILO$hostname"
+ILO_pwd="Superuser"
+ILO_ip=$iloipaddress
+ILO_mask=$ilonetmask
+ILO_gw=$gateway
+log INFO "Settings for ilo are: $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname"
+log INFO "Launching the command /usr/sbin/set_ilo_mirror.sh $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname and mirroring eventually the disks"
+Set=$(set_ilo_mirror.sh $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname)
+log INFO "Results for script: $Set"
+}
+
+
+#Functions to configure proliant servers
+
+checkProliant () {
+
+#check if proliant
+check=$(dmidecode -s system-product-name | grep  ProLiant ||  echo 'NOK')
+log WARN "Check Proliant result: $check"
+if [[  "$check" != *"NOK"* ]]; then
+echo "OK"
+else
+echo "NOK"
+fi
+
+}
+
+SEND () {
+
+
+perl -e '
+use integer;
+use POSIX qw(strftime);
+use Backticks;
+use Data::Dumper;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use LWP::Simple;
+use strict;
+use warnings;
+use integer;
+use Switch;
+use JSON ;
+use feature qw(switch);
+use HTTP::Cookies;
+use HTTP::Request;
+use LWP;
+my $REST = shift;
+my $uri = shift;
+my $lwp = LWP::UserAgent->new(
+                        timeout               => 10,
+);
+my $req = HTTP::Request->new( "PUT", "$uri" );
+$req->content($REST);
+my $resp = $lwp->request($req);
+print $req->as_string;
+#print Dumper $resp;
+' "$REST" "$URI"
+
+
+}
+
+createMonitorRecord () {
+ status="$1"
+ PK="[$salesOrder][$subid]"
+ URI="http://10.0.205.204/SPOT/provisioning/api/provisioningnotifications/$PK"
+
+                            REST="{
+        \"notifid\":\"$PK\",
+        \"hostname\":\"$hostname\",
+        \"installationip\":\"putty://$clientIP\",
+        \"configuredip\":\"$ipaddress\",
+        \"status\":\"<b>$status</b>\",
+        \"progress\":\"$PROGRESS\",
+        \"image\":\"$ISO\",
+        \"firmware\":\"$MANUFACTURER\",
+        \"ram\":\"$RAM_tot\",
+        \"cpu\":\"$NUMPROC\",
+        \"diskscount\":\"$DISKCOUNT\",
+        \"netintcount\":\"$NETCOUNT\",
+        \"model\":\"$MODEL\",
+        \"serial\":\"$MACHSERIAL\",
+        \"os\":\"RedHat\"
+        }"
+        SEND  > /dev/null 2>&1
+
+}
+
+LINUX_system () {
+        NUMPROC=$(grep -c "physical id" </proc/cpuinfo | sort | uniq)
+        MACHSERIAL=$(dmidecode -s system-serial-number | grep -v '#')
+        MANUFACTURER=$(dmidecode -s system-manufacturer | grep -v '#')
+        NETCOUNT=$(/usr/share/drbl/bin/get-nic-devs | wc -l)
+        MODEL=$(dmidecode -s system-product-name | grep -v '#')
+        RAM_tot=$(grep MemTotal /proc/meminfo | cut -d':' -f2 | cut -d 'k' -f1)
+        RAM_tot=$(echo "$RAM_tot" | xargs)
+        RAM_tot=$(( RAM_tot / 1000 ))
+
+        NUMPROC=$(echo "$NUMPROC" | xargs )
+        MACHSERIAL=$(echo "$MACHSERIAL" | xargs)
+        MANUFACTURER=$(echo "$MANUFACTURER" | xargs)
+        MODEL=$(echo "$MODEL" | xargs)
+        DISKCOUNT=$(lsblk -o NAME -i -d -n -e 1,11 | wc -l)
+}
+
+
+
+
+clean_up() { # Perform pre-exit housekeeping
+  return
+}
+
+error_exit() {
+  echo -e "${PROGNAME}: ${1:-"Unknown Error"}" >&2
+  clean_up
+  exit 1
+}
+
+graceful_exit() {
+  clean_up
+  exit
+}
+
+signal_exit() { # Handle trapped signals
+  case $1 in
+    INT)
+      error_exit "Program interrupted by user" ;;
+    TERM)
+      echo -e "\n$PROGNAME: Program terminated" >&2
+      graceful_exit ;;
+    *)
+      error_exit "$PROGNAME: Terminating on unknown signal" ;;
+  esac
+}
+
+usage() {
+  echo -e "Usage: $PROGNAME [--help] [-pos] [-t] [-ip] [-n] [-g] [-s] [-h] [-iloip] [-ilonm]"
+}
+
+help_message() {
+  cat <<- _EOF_
+  $PROGNAME ver. $VERSION
+  Restore comopletely generic redhat iso  to new physical/virtual machines using the existing PXE environment
+
+  $(usage)
+
+  Options:
+  --help  Display this help message and exit.
+  -pos Rack position or DHCP ip address of this client
+  -t  Generic  iso image name (mounted in http web  dir)
+  -ip  Ip address to assign after restoration
+  -n  Netmask
+  -g  Gateway
+  -s  Sales order number (if any)
+  -h  Hostname
+  -iloip  Ip address to assign to ilo
+  -ilonm  Netmask for ilo
+
+  NOTE: 
+         - You must be the superuser to run this script.
+         - Only 2 parameters are mandatory:  -pos [Rack position/ Dhcp ip address] -t [ISO name]
+         - Note that if the server is a Proliant, the mirror is automatically built if two disks are found
+
+_EOF_
+  return
+}
+
+
+# Ssh execute function
+
+sshExe() {
+# $1 client ip
+#
+# $2 command or function
+# No password required because we run on drbl server
+sshpass -p Superuser ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t root@$1 " $2"
+if [[ $? -ne 0 ]]
+then
+log ERROR "Execution Error! May be ssh connection problem or execution of command'$2' issue. I will exit now."
+log ERROR "The command was: ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t root@$1 \" $2\""
+exit 299
+fi
+}
+
+# check IP address function
+valid_ip() {
+ERROR=0
+    oldIFS=$IFS
+    IFS=.
+    set -f
+    set -- $1
+    if [ $# -eq 4 ]
+    then
+      for seg
+      do
+        case $seg in
+            ""|*[!0-9]*) ERROR=1;break ;; ## Segment empty or non-numeric char
+            *) [ $seg -gt 255 ] && ERROR=2 ;;
+        esac
+      done
+    else
+      ERROR=3 ## Not 4 segments
+    fi
+    IFS=$oldIFS
+    set +f
+    return $ERROR
+}
+
+
+log() {
+local level=${1?}
+shift
+local code=0 
+local line="[$(date '+%F %T')] $level: $*"
+if [ -t 2 ]
+then
+case "$level" in
+INFO) code=36 ;;
+DEBUG) code=30 ;;
+WARN) code=33 ;;
+ERROR) code=31 ;;
+*) code=37 ;;
+esac
+echo -e "\e[${code}m${line}\e[0m"
+else
+echo "$line"
+fi >&2
+
+#LOG to web services
+#Create one section for each web service
+REST='{"title":"genericLinuxKickstart | '$subid'","content":"'$line'","userid":"'$(whoami)'","date":"'$(date)'"}'
+(
+perl - "$REST"  <<'_HERE_'
+use integer;
+use POSIX qw(strftime);
+use Backticks;
+use Data::Dumper;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use LWP::Simple;
+use strict;
+use warnings;
+use integer;
+use Switch;
+use JSON ;
+use feature qw(switch);
+use HTTP::Cookies;
+use HTTP::Request;
+use LWP;
+use File::Path qw{mkpath};
+my $uri = "http://10.0.205.204/SPOT/provisioning/api/events";
+my $REST = shift;
+my $lwp = LWP::UserAgent->new(
+                        timeout               => 10,
+);
+my $req = HTTP::Request->new( 'POST', "$uri" );
+$req->content($REST);
+my $resp = $lwp->request($req);
+print $req->as_string;
+#print Dumper $resp;
+_HERE_
+) > /dev/null 2>&1  
+
+if [[ ! -z $rackPosition ]] && [[ ! -z $salesOrder ]]; then createMonitorRecord "$line"; fi
+
+}
+
+check_args() {
+#put here the mandatory params
+
+if [[ "$rackPosition" == $clientIP ]]; then
+        Rack="Virtual"
+        Shelf=$clientIP
+ else
+        # Get the rack and shelf variable
+        Rack=$(echo $rackPosition | awk -F "_" '{print $1}')
+        Shelf=$(echo $rackPosition | awk -F "_" '{print $2}')
+ fi
+subid=$Rack"_"$Shelf
+
+
+
+([[ -z "$ISO"  ]] ) && log ERROR "Some mandatory parameters missing!!!!!" && usage && error_exit "Review the usage"
+ valid_ip "$ipaddress" && [ "$ERROR" -ne 0 ] && log ERROR "Ip address not valid" && exit 1
+ valid_ip "$netmask" && [ "$ERROR" -ne 0 ] && log ERROR "Netmask not valid" && exit 1
+ valid_ip "$gateway" && [ "$ERROR" -ne 0 ] && log ERROR "Gateway not valid" && exit 1
+	# Check if is a generic image, contacting the webserver.
+	RET=$(curl -o /dev/null --silent --head --write-out '%{http_code}'  $WEBSERVER/$ISO)
+	if [ $RET -eq 404 ]; then
+		log ERROR "The image $ISO doesn't exist, please check the name"
+		WEBISO=$( w3m -dump $WEBSERVER | grep iso | awk -F "/" '{print $1}' | awk '{print $2}')
+		log INFO "Possible values are:\n$WEBISO"
+		exit 1
+	fi
+}
+# check IP address function
+valid_ip() {
+ERROR=0
+    oldIFS=$IFS
+    IFS=.
+    set -f
+    set -- "$1"
+    if [ $# -eq 4 ]
+    then
+      for seg
+      do
+        case $seg in
+            ""|*[!0-9]*) ERROR=1;break ;; ## Segment empty or non-numeric char
+            *) [ $seg -gt 255 ] && ERROR=2 ;;
+        esac
+      done
+    else
+      ERROR=3 ## Not 4 segments
+    fi
+    IFS=$oldIFS
+    set +f
+    return $ERROR
+}
+
+exec_cmd()
+{
+    if [[ ! -z $verbose ]]
+    then
+        log INFO "Running: $1"
+    fi
+    # TODO: is that the right way to do it?
+    $1
+    if [ $? != 0 ]
+    then
+        log ERROR"!! Error while running: $1 !!"
+        error_exit "$PROGNAME: Error running $1 , stderr code $?"
+    fi
+}
+
+
+# Trap signals
+trap "signal_exit TERM" TERM HUP
+trap "signal_exit INT"  INT
+
+# Check for root UID
+if [[ $(id -u) != 0 ]]; then
+  error_exit "You must be the superuser to run this script."
+fi
+
+# Parse command-line
+while [[ -n $1 ]]; do
+  case $1 in
+    --help)
+      help_message; graceful_exit ;;
+    -pos)
+        rackPosition="$2"
+	;;
+    -t)
+	ISO="$2"
+       ;;
+    -ip)
+	ipaddress="$2"
+       ;;
+    -n)
+	netmask="$2" # You may want to check validity of $2
+       ;;
+    -g)
+	gateway="$2"   # You may want to check validity of $2
+       ;;
+    -s)
+	salesOrder="$2" # You may want to check validity of $2
+       ;;
+    -h)
+	hostname="$2"   # You may want to check validity of $2
+       ;;
+    -iloip)
+	iloipaddress="$2"
+       ;;
+    -ilonm)
+        ilonetmask="$2"
+       ;;
+    -* | --*)
+      usage
+      error_exit "Unknown option $1" ;;
+    *)
+      ;;
+  esac
+  shift 2
+done
+clientIP="$(ifconfig | grep -A 1 'eth0' | tail -1 | cut -d ':' -f 2 | cut -d ' ' -f 1)"
+check_args
+
+log INFO "Set defaults value if not specified in command line..."
+# Set the defaults values
+[[ -z "$hostname" ]] && hostname="nagrasrv01"                                                   && log INFO "Set the hostname to '$hostname'"
+[[ -z "$ipaddress" ]] && ipaddress="10.0.133.$((RANDOM%=255))"                          && log INFO "Set the ip address to '$ipaddress'"
+[[ -z "$netmask" ]] && netmask="255.255.255.0"                                                  && log INFO "Set the netmask to '$netmask'"
+[[ -z "$gateway" ]] && gateway="10.0.133.252"                                                   && log INFO "Set the gateway to '$gateway'"
+[[ -z "$ilohostname" ]] && ilohostname="ILO$hostname"                                           && log INFO "Assuming ilo hostname for proliant server equal to '$ilohostname'"
+[[ -z "$iloipaddress" ]] && iloipaddress="10.0.133.$((RANDOM%=255))"                    && log INFO "Assuming ilo ip address for proliant server equal to '$iloipaddress'"
+[[ -z "$ilonetmask" ]] && ilonetmask="255.255.255.0"                                            && log INFO "Assuming ilo netmask for proliant server equal to '$ilonetmask'"
+[[ -z "$salesOrder" ]] && salesOrder="99999999"                                                 && log INFO "Set sales order to '$salesOrder'"
+
+
+# Main logic
+# contact time server and set the correct soft and hw time
+PROGRESS=2
+
+syncTime
+
+
+#clientIP="$(ifconfig | grep -A 1 'eth0' | tail -1 | cut -d ':' -f 2 | cut -d ' ' -f 1)"
+#image=$ISO
+#iso_full_input_path="$isoPATH/$ISO"   # You may want to check validity of $2
+ # Workaround for NFS file STALE
+#        while true; do mount -o remount,rw -a; sleep 10; done &
+
+# Config proliant servers
+PROGRESS=5
+log INFO "Checking if the server is a proliant server...."
+proliant=$(checkProliant)
+if [[ "$proliant" == "OK" ]]; then
+#Set ILO configuration
+PROGRESS=10
+log INFO "Set the ILO configuration and create the logical volume ....."
+
+setILOMIRROR
+fi
+
+#the SSH execution is assured in the function
+PROGRESS=20
+log INFO "Executing Linux Inventory"
+#inventoryLinux
+LINUX_system
+
+PROGRESS=30
+log INFO "Creating necessary files...."
+
+createConf
+PROGRESS=50
+# Reboot to installed image
+log INFO "GOOD: ILO is configured and boot mode is now legacy mode (Proliant). Client now reboot to boot in install environment"
+#Clean remote comman table
+perl /usr/local/bin/removeCommand.pl
+/sbin/reboot
+
+graceful_exit
+
